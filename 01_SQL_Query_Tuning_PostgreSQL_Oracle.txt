@@ -1,0 +1,505 @@
+# SQL Query Tuning — PostgreSQL and Oracle
+# Basic to advanced, ready to use in production support
+
+Use this when a report, recon, or API is slow because of the database.
+Always capture: SQL text, bind values if safe, runtime, row counts, and the plan.
+
+---
+
+## 1. How the database picks a plan
+
+The optimizer estimates cost from:
+
+- table and index statistics (row counts, distinct values, histograms)
+- available indexes
+- join order
+- memory settings (sort, hash)
+- data distribution (skew)
+
+A plan is a guess. `EXPLAIN` shows the guess. `EXPLAIN ANALYZE` (PostgreSQL) or a real trace (Oracle) shows what actually happened.
+
+Rule: if estimated rows and actual rows differ by 10x or more, statistics or predicates are the first place to look.
+
+---
+
+## 2. Read a plan — the words that matter
+
+| What you see | Meaning |
+|---|---|
+| Seq Scan / TABLE ACCESS FULL | Read most or all of the table |
+| Index Scan / INDEX RANGE SCAN | Use an index, then fetch rows |
+| Index Only Scan / INDEX FAST FULL | Answer from the index alone |
+| Bitmap Index Scan | Combine several index conditions, then fetch |
+| Nested Loop | For each outer row, probe the inner side. Good when outer set is small |
+| Hash Join | Build a hash of one side, probe the other. Good for larger sets if memory fits |
+| Merge Join | Both sides sorted on the join key |
+| Sort | Explicit sort. Watch memory and temp spill |
+| Filter | Rows read, then thrown away. Often a missing or unusable index |
+
+PostgreSQL also shows:
+
+- `actual time` — real milliseconds
+- `rows` — actual rows
+- `loops` — how many times the node ran (nested loop multiplies cost)
+- `Buffers: shared hit/read` — cache hit vs disk read
+- `Rows Removed by Filter` — wasted reads
+
+Oracle plan columns:
+
+- `E-Rows` estimated, `A-Rows` actual (with `DBMS_XPLAN` + stats)
+- `Starts` — same idea as loops
+- `Buffers` — logical reads
+
+---
+
+## 3. Basic tuning checklist
+
+Do these before adding an index.
+
+1. Run the exact SQL the app runs, with realistic filters.
+2. Confirm the filter reduces rows. `WHERE status = 'X'` on a column where 90% of rows are `X` will still scan.
+3. Select only needed columns. `SELECT *` blocks index-only plans and moves extra data.
+4. Put selective predicates in `WHERE`, not in the `SELECT` list.
+5. Avoid functions on indexed columns:
+
+```sql
+-- index on created_on is not used
+WHERE TRUNC(created_on) = DATE '2026-09-16'
+
+-- index can be used
+WHERE created_on >= TIMESTAMP '2026-09-16 00:00:00'
+  AND created_on <  TIMESTAMP '2026-09-17 00:00:00'
+```
+
+6. Join on the same data type. `varchar` = `bigint` forces a cast and can drop the index.
+7. Check for an accidental cartesian product (missing join condition).
+8. Update statistics if the table changed a lot.
+
+---
+
+## 4. Indexes — when they help
+
+Create an index when the query repeatedly looks up a small fraction of a large table.
+
+Good candidates:
+
+- `WHERE subscriber_id = ?`
+- `WHERE resource_value = ? AND expiration_date IS NULL`
+- `WHERE offer_id = ? AND offer_exp_date IS NULL`
+- foreign-key join columns on the child table
+
+Composite index column order: equality columns first, then the range column.
+
+```sql
+-- matches: subscriber_id = ? AND offer_exp_date IS NULL
+CREATE INDEX ape1_subscr_offers_sub_exp_idx
+  ON prodcust1.ape1_subscr_offers (subscriber_id, offer_exp_date);
+```
+
+PostgreSQL partial index (very useful for “active row” queries):
+
+```sql
+CREATE INDEX CONCURRENTLY agd1_res_active_msisdn_idx
+  ON prodcust1.agd1_resources (resource_value)
+  WHERE expiration_date IS NULL
+    AND resource_type = 29;
+```
+
+`CONCURRENTLY` avoids a long lock. It cannot run inside a transaction block.
+
+Oracle equivalent idea:
+
+```sql
+CREATE INDEX agd1_res_active_msisdn_idx
+  ON prodcust1.agd1_resources (resource_value)
+  TABLESPACE <ts>
+  ONLINE;
+-- plus a function/virtual column if you must index a filtered subset
+```
+
+Do not index every column. Each index slows inserts/updates and needs stats.
+
+Leading wildcard kills a normal B-tree:
+
+```sql
+WHERE resource_value LIKE '%9989'   -- cannot use normal index
+WHERE resource_value LIKE '9989%'   -- can use index
+```
+
+---
+
+## 5. PostgreSQL — commands
+
+### See the real plan
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE)
+SELECT ... ;
+```
+
+On a standby, a long `ANALYZE` can be cancelled with:
+
+`canceling statement due to conflict with recovery`
+
+That is replica replay, not a bad SQL syntax error. Retry, shorten the query, or run on primary if approved.
+
+### Find slow statements
+
+```sql
+-- needs pg_stat_statements enabled
+SELECT calls,
+       round(total_exec_time::numeric, 1) AS total_ms,
+       round(mean_exec_time::numeric, 1) AS avg_ms,
+       rows,
+       left(query, 200) AS query
+FROM pg_stat_statements
+ORDER BY total_exec_time DESC
+LIMIT 20;
+```
+
+### Locks and blockers
+
+```sql
+SELECT pid, usename, state, wait_event_type, wait_event,
+       now() - query_start AS runtime, left(query, 200)
+FROM pg_stat_activity
+WHERE state <> 'idle'
+ORDER BY query_start;
+```
+
+```sql
+SELECT blocked.pid AS blocked_pid,
+       blocking.pid AS blocking_pid,
+       left(blocked.query, 120) AS blocked_query
+FROM pg_stat_activity blocked
+JOIN pg_stat_activity blocking
+  ON blocking.pid = ANY (pg_blocking_pids(blocked.pid));
+```
+
+Cancel only your own runaway query:
+
+```sql
+SELECT pg_cancel_backend(<pid>);   -- polite
+SELECT pg_terminate_backend(<pid>); -- hard, use with care
+```
+
+### Table bloat and stats
+
+```sql
+SELECT relname, n_live_tup, n_dead_tup, last_vacuum, last_autovacuum, last_analyze
+FROM pg_stat_user_tables
+WHERE relname IN ('ape1_subscr_offers', 'agd1_resources', 'ncm_future_charges')
+ORDER BY n_dead_tup DESC;
+```
+
+```sql
+ANALYZE prodcust1.ape1_subscr_offers;
+```
+
+`VACUUM` reclaims dead rows. `VACUUM FULL` rewrites the table and locks it. Do not run `VACUUM FULL` on prod without a window.
+
+### Memory knobs you will see in plans
+
+- `work_mem` — sort and hash per operation. Too small = temp files. Too large × many sessions = RAM exhaustion.
+- `shared_buffers` — database cache.
+- Spill in the plan looks like `Sort Method: external merge` or hash batches > 1.
+
+Session-only increase for one heavy recon:
+
+```sql
+SET work_mem = '256MB';
+SET statement_timeout = '5min';
+```
+
+### Rewrite patterns that usually get faster
+
+Correlated `NOT EXISTS` on a huge table, scanned per row, often times out on standby. Aggregate once:
+
+```sql
+WITH flags AS (
+  SELECT subscriber_id,
+         max(CASE WHEN offer_exp_date IS NULL THEN 1 ELSE 0 END) AS has_open,
+         max(CASE WHEN offer_exp_date::date = DATE '2026-09-16' THEN 1 ELSE 0 END) AS closed_16
+  FROM prodcust1.ape1_subscr_offers
+  GROUP BY subscriber_id
+)
+SELECT subscriber_id
+FROM flags
+WHERE closed_16 = 1
+  AND has_open = 0;
+```
+
+`DISTINCT ON` needs the `ORDER BY` to start with the same columns:
+
+```sql
+SELECT DISTINCT ON (subscriber_id)
+       subscriber_id, resource_value, effective_date
+FROM prodcust1.agd1_resources
+WHERE expiration_date IS NULL
+  AND resource_type = 29
+ORDER BY subscriber_id, effective_date DESC NULLS LAST;
+```
+
+### Window functions (support daily use)
+
+Latest row per key:
+
+```sql
+SELECT *
+FROM (
+  SELECT t.*,
+         row_number() OVER (
+           PARTITION BY resource_value
+           ORDER BY last_modified_on DESC, id DESC
+         ) AS rn
+  FROM prodcust1.ncm_future_charges t
+) s
+WHERE rn = 1;
+```
+
+Duplicates, keep newest, list the rest:
+
+```sql
+SELECT *
+FROM (
+  SELECT f.*,
+         count(*) OVER (
+           PARTITION BY resource_value, external_offer_instance_id, charge_date::date
+         ) AS cnt,
+         row_number() OVER (
+           PARTITION BY resource_value, external_offer_instance_id, charge_date::date
+           ORDER BY last_modified_on DESC, id DESC
+         ) AS rn
+  FROM prodcust1.ncm_future_charges f
+) s
+WHERE cnt > 1
+  AND rn > 1;
+```
+
+### CTE note
+
+In PostgreSQL 12+, a CTE is usually inlined like a subquery. Add `MATERIALIZED` when you want it computed once and reused:
+
+```sql
+WITH eligible AS MATERIALIZED (
+  SELECT ...
+)
+SELECT * FROM eligible;
+```
+
+---
+
+## 6. Oracle — commands
+
+### Plan
+
+```sql
+EXPLAIN PLAN FOR
+SELECT ... ;
+
+SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY);
+```
+
+Better, with actual stats after the SQL ran (needs privileges):
+
+```sql
+SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL, 'ALLSTATS LAST'));
+```
+
+### What is running
+
+```sql
+SELECT s.sid, s.serial#, s.username, s.status, s.event,
+       s.seconds_in_wait, q.sql_id, q.sql_text
+FROM v$session s
+LEFT JOIN v$sql q ON q.sql_id = s.sql_id
+WHERE s.username IS NOT NULL
+  AND s.status = 'ACTIVE';
+```
+
+### Find a SQL by text
+
+```sql
+SELECT sql_id, executions, elapsed_time/1000000 AS elapsed_sec,
+       buffer_gets, disk_reads, rows_processed,
+       substr(sql_text, 1, 200) AS sql_text
+FROM v$sql
+WHERE sql_text LIKE '%ncm_future_charges%'
+  AND sql_text NOT LIKE '%v$sql%'
+ORDER BY elapsed_time DESC;
+```
+
+### Full SQL text
+
+```sql
+SELECT sql_fulltext
+FROM v$sql
+WHERE sql_id = '<sql_id>';
+```
+
+### Stats
+
+```sql
+EXEC DBMS_STATS.GATHER_TABLE_STATS(
+  ownname => 'PRODCUST1',
+  tabname => 'APE1_SUBSCR_OFFERS',
+  estimate_percent => DBMS_STATS.AUTO_SAMPLE_SIZE,
+  cascade => TRUE
+);
+```
+
+Check staleness:
+
+```sql
+SELECT table_name, num_rows, last_analyzed, stale_stats
+FROM all_tab_statistics
+WHERE owner = 'PRODCUST1'
+  AND table_name = 'APE1_SUBSCR_OFFERS';
+```
+
+### Index
+
+```sql
+CREATE INDEX prodcust1.ape1_sub_offer_idx
+  ON prodcust1.ape1_subscr_offers (subscriber_id, offer_id, offer_exp_date)
+  ONLINE;
+```
+
+See if an index is used:
+
+```sql
+SELECT index_name, table_name, uniqueness, status
+FROM all_indexes
+WHERE owner = 'PRODCUST1'
+  AND table_name = 'APE1_SUBSCR_OFFERS';
+
+SELECT index_name, column_name, column_position
+FROM all_ind_columns
+WHERE index_owner = 'PRODCUST1'
+  AND table_name = 'APE1_SUBSCR_OFFERS'
+ORDER BY index_name, column_position;
+```
+
+### Hints — last resort, not the first move
+
+```sql
+SELECT /*+ INDEX(o APE1_SUB_OFFER_IDX) */ ...
+SELECT /*+ LEADING(e o) USE_NL(o) */ ...
+SELECT /*+ FULL(t) */ ...   -- force scan; rare, for tiny tables mis-indexed
+```
+
+A hint that names a missing index is ignored. After a stats/index fix, remove the hint.
+
+### Bind variables
+
+Oracle peeks at the first bind and may keep a plan that is bad for other values (bind peeking / adaptive cursor sharing).
+
+Symptom: same SQL is fast for one subscriber and slow for another.
+
+Check:
+
+```sql
+SELECT sql_id, child_number, plan_hash_value, executions, is_bind_sensitive, is_bind_aware
+FROM v$sql
+WHERE sql_id = '<sql_id>';
+```
+
+### TKPROF (when DBA gives a trace)
+
+```text
+ALTER SESSION SET sql_trace = TRUE;   -- or DBMS_MONITOR
+-- run the SQL
+tkprof <tracefile> out.txt sort=exeela explain=user/pass
+```
+
+Read: high `query`/`disk` vs low `rows` means you read too much to return too little.
+
+### Locks
+
+```sql
+SELECT s.sid, s.serial#, s.username, l.type, l.lmode, l.request
+FROM v$lock l
+JOIN v$session s ON s.sid = l.sid
+WHERE l.block = 1;
+```
+
+---
+
+## 7. Same problem, both engines
+
+| Goal | PostgreSQL | Oracle |
+|---|---|---|
+| Estimated plan | `EXPLAIN` | `EXPLAIN PLAN` + `DBMS_XPLAN.DISPLAY` |
+| Actual plan | `EXPLAIN (ANALYZE, BUFFERS)` | `DISPLAY_CURSOR` `ALLSTATS LAST` |
+| Refresh stats | `ANALYZE table` | `DBMS_STATS.GATHER_TABLE_STATS` |
+| Running SQL | `pg_stat_activity` | `v$session` + `v$sql` |
+| Kill query | `pg_cancel_backend` | `ALTER SYSTEM KILL SESSION` (DBA) |
+| Online index | `CREATE INDEX CONCURRENTLY` | `CREATE INDEX ... ONLINE` |
+| Top SQL | `pg_stat_statements` | `v$sql` / AWR |
+
+---
+
+## 8. Advanced patterns
+
+### Pagination
+
+```sql
+-- PostgreSQL and Oracle 12c+
+SELECT ...
+ORDER BY id
+OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY;
+```
+
+Deep `OFFSET 1000000` still sorts/scans. Keyset pagination is faster:
+
+```sql
+WHERE id > :last_id
+ORDER BY id
+FETCH NEXT 100 ROWS ONLY;
+```
+
+### Anti-join
+
+“No active price plan” is an anti-join. Prefer `NOT EXISTS` over `NOT IN` when the inner column can be NULL. `NOT IN` with a NULL returns no rows.
+
+```sql
+WHERE NOT EXISTS (
+  SELECT 1
+  FROM prodcust1.ape1_subscr_offers a
+  WHERE a.subscriber_id = o.subscriber_id
+    AND a.offer_id = o.offer_id
+    AND a.offer_exp_date IS NULL
+)
+```
+
+### Skew
+
+One `customer_id` has millions of rows, others have 10. Nested loop or hash can look fine in estimates and explode in reality. Split the heavy key, or add a more selective predicate (`charge_date` range).
+
+### Partitioning
+
+If the table is partitioned by `charge_date` or cycle, the `WHERE` must include the partition key or the database scans every partition (partition pruning miss).
+
+### Standby / recovery conflict (PostgreSQL)
+
+Long queries on a replica die when vacuum on primary removes row versions. Fixes you can do:
+
+- shorten SQL (one grouped scan, not per-row lookup)
+- `SET statement_timeout`
+- retry
+- run on primary only with approval
+
+DBA-side: `hot_standby_feedback`, `max_standby_streaming_delay`.
+
+---
+
+## 9. What to write in an RCA
+
+1. SQL id / statement
+2. Runtime before and after
+3. Plan node that dominated (seq scan, nested loop loops=2e6, temp spill)
+4. Estimated vs actual rows
+5. Change: rewrite, index, stats, extra predicate
+6. Proof: new plan + timing on the same data volume
+
+Do not “tune” by adding hints until the plan evidence is written down.
